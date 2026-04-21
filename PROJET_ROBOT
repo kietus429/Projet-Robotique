@@ -1,0 +1,352 @@
+
+/******************* BIBLIOTHEQUES *******************************************/
+
+#include "nboard.h"
+#include <math.h>
+#include <stdbool.h>
+
+/******************* CONSTANTES SYMBOLIQUES **********************************/
+
+#define BP0 !GPIO_read(PA_9)
+#define BP1 !GPIO_read(PA_10)
+#define BP2 !GPIO_read(PB_0)
+#define CaptFC !GPIO_read(PB_7)
+#define Jack !GPIO_read(PB_6)
+#define PWMG PB_4
+#define PWMD PB_5
+#define NOT_ONLY_PID 0
+
+extern uint8_t BusSelectMux;
+extern uint8_t Bus8Led;
+/******************* PROTOTYPES DE FONCTIONS *********************************/
+
+void Automate(void);
+
+/******************* PROGRAMME PRINCIPAL *************************************/
+
+int main(void)
+{
+	// Définition et initialisation des variables locales
+	// Initialisation de la carte et actions à faire une fois au démarrage
+	NB_init();
+	bus_write(BusSelectMux,0x07);
+
+	// Actions à répéter indéfiniment
+	while (1)
+	{
+		TIM_wait_us(10);
+		Automate();
+	}
+}
+
+/* Exemple de fonction ****************************************************/
+
+void Automate(void)
+{
+	typedef enum {Redressement, RaccourciFast, Raccourci3, Raccourci2, SeuilCapt, ValeurKd, Attente1, Attente3,AttenteJack, Raccourci, Attente2,  FinDeCourse, ValeurKp, Avancer, Arret} type_etat;
+	static type_etat etat_futur = SeuilCapt;
+	static type_etat etat_courant = SeuilCapt;
+	static float MotG, MotD, VitMoy, VitRaccourci; // valeurs moteurs
+	static float CaptEG, CaptG, CaptD, CaptED;	//valeurs des capteurs
+	static float derniereErreur = 0.0;
+	static float sommeErreurs = 0.0;
+	static bool ValRaccourci=false;
+	static bool ValSecondRaccourci=false;
+	static bool ValTroisiemeRaccourci=false;
+	//static uint8_t ValSecondRaccourci, ValTroisiemeRaccourci;
+	static uint16_t ValPot, Seuil_haut, Seuil_bas, t, ValRaccourciVal;
+	static float SHf,SBf;
+
+	static uint16_t Minuteur_ecran;
+	Minuteur_ecran++;
+
+	/* Lecture ADC valeur capteur*/
+	bus_write(BusSelectMux, 0x01);
+	CaptEG=(float)(NB_ADC_read(PB_1)/(float)Seuil_haut); // Capteur Extreme Gauche
+	bus_write(BusSelectMux, 0x03);
+	CaptG=(float)(NB_ADC_read(PB_1)/(float)Seuil_haut); // Capteur Gauche
+	bus_write(BusSelectMux, 0x04);
+	CaptD=(float)(NB_ADC_read(PB_1)/(float)Seuil_haut); // Capteur Droit
+	bus_write(BusSelectMux, 0x00);
+	CaptED=(float)(NB_ADC_read(PB_1)/(float)Seuil_haut); // Capteur Extreme Droite
+
+
+	// Les variables PID tahia al djezair !
+	static float Kp;  // Sensibilité du virage **PROPORTIONNALITE**
+	static float Ki = 0.00; // Correction ligne droite **INTEGRALE**
+	static float Kd;  // Amortissement des oscillations **DERIVEE**
+
+	//****************************** Partie Calcul ******************************
+
+	float erreur = CaptG - CaptD; // erreur entre la gauche et la droite
+	// float erreur = (3.0 * CaptEG + CaptG) - (CaptD + 3.0 * CaptED)// Contre sinusoides
+
+	/* sommeErreurs = sommeErreurs+erreur; //Integrale
+	// Sécurités : Si erreur change de signe on met sommeErreurs à 0 pour éviter confusion lors du prochaine virage
+	 if ((erreur > 0 && derniereErreur < 0) || (erreur < 0 && derniereErreur > 0)) sommeErreurs = 0;
+	if (sommeErreurs > 1.0) sommeErreurs = 1.0;
+	if (sommeErreurs < -1.0) sommeErreurs = -1.0; */
+
+	float derivee = erreur - derniereErreur; // vitesse de variation du moteur
+	float correction = (erreur * Kp) + (derivee * Kd) + (sommeErreurs * Ki); //correction = (changement de vitesse) + (amortisseur)
+
+	float ReductionVitesse = fabs(erreur) * 0.1; //reduction de vitesse proportionnel à la correction
+	float VitesseAdaptative = VitMoy - ReductionVitesse; // enleve vitesse selon le degré de courbe
+	if (VitesseAdaptative < 0.55) VitesseAdaptative = 0.55;
+
+	etat_courant=etat_futur;
+
+	switch(etat_futur){
+
+		case SeuilCapt : //definition des seuils capteurs
+			TIM_start();
+			bus_write(BusSelectMux, 0x01);
+			Seuil_haut=NB_ADC_read(PB_1);//+100;
+			bus_write(BusSelectMux, 0x00);
+			Seuil_bas=NB_ADC_read(PB_1);//+100;
+			SBf=(float)((float)Seuil_bas/(float)Seuil_haut)+0.15;
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("SH = %4d", Seuil_haut);
+			IHM_LCD_locate(1,0);
+			IHM_LCD_printf("SB =%4d = %3.2f", Seuil_bas, (float)((float)Seuil_bas/(float)Seuil_haut));
+			if(BP0)etat_futur=Attente1;
+			break;
+
+		case Arret :
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("     Arret    ");
+			if(BP2)etat_futur=AttenteJack;
+			if(BP0)etat_futur=Attente1;
+			if(CaptFC)etat_futur=FinDeCourse;
+			TIM_reset();
+			break;
+
+		case Raccourci :
+			t=TIM_read_ms()/500;
+			if (t<1)
+			{
+				MotG=0.0;
+				MotD=0.0;
+			}
+			else
+			{
+				MotG=0.0;
+				MotD=0.4;
+			}
+			if (t>1) {
+				TIM_reset();
+				etat_futur=Raccourci2;
+			}
+			break;
+
+		case Raccourci3 :
+			t=TIM_read_ms()/500;
+			if (t<1)
+			{
+				MotG=0.0;
+				MotD=0.0;
+			}
+			else
+			{
+				MotG=0.0;
+				MotD=0.4;
+			}
+
+			if (t>3) {
+				TIM_reset();
+				etat_futur=Raccourci2;
+			}
+			break;
+
+		case Raccourci2 :
+			t=TIM_read_ms()/500; // 0.5s timer
+
+			ValSecondRaccourci=false;
+			ValRaccourci=false;
+			ValTroisiemeRaccourci=false;
+
+			if (CaptD > 0.8 && CaptG > 0.8) {
+				MotG = 0.3;
+				MotD = 0.0;
+			}
+			if (CaptD > 0.8 && CaptG > 0.8 && t>2)
+			{
+
+				derniereErreur = CaptG - CaptD;
+				TIM_reset();
+				etat_futur = Avancer;
+			}
+			break;
+
+
+		case Avancer :
+			derniereErreur = erreur; //Derivee
+			//t=TIM_read_ms()/250;
+			if(CaptFC)etat_futur=FinDeCourse;
+
+			/*if(ValRaccourci <=0)etat_futur=RaccourciFast;
+			 */
+			if (ValSecondRaccourci) {
+				TIM_reset();
+				etat_futur=Raccourci;
+			}
+			if (ValTroisiemeRaccourci) {
+				TIM_reset();
+				etat_futur=Raccourci3;
+			}
+			break;
+
+		case RaccourciFast:
+			MotD=0.7;
+			MotG=0.5;
+			TIM_reset();
+			if (CaptG >0.6 && CaptD >0.8) etat_futur = Redressement;
+			break;
+
+		case Redressement:
+			t=TIM_read_ms()/500;
+			MotG = (VitesseAdaptative-0.3) - correction;
+			MotD = (VitesseAdaptative-0.3) + correction;
+			if (CaptG >0.6 && CaptD >0.8 && t>2) {
+				TIM_reset();
+				etat_futur = Avancer;
+			}
+			break;
+
+		case ValeurKp:
+			bus_write(BusSelectMux, 0x07);
+			ValPot=NB_ADC_read(PB_1);
+			VitMoy = 0.60 ; // VITESSE MOTEUR MOYENNE
+			Kp=(float)ValPot/2045.0;
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("Kp = %4.2f%%", Kp);
+			if(BP0)etat_futur=Attente2;
+			break;
+
+		case ValeurKd :
+			bus_write(BusSelectMux, 0x07);
+			ValPot=NB_ADC_read(PB_1);
+			Kd=(float)ValPot/1500.0;
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("Kd = %4.2f%%", Kd);
+			if(BP0)etat_futur=Attente3;
+			break;
+
+		case FinDeCourse :
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("   FinDeCourse");
+			if(BP2)etat_futur=Arret;
+			if(BP0)etat_futur=ValeurKp;
+			break;
+
+		case Attente1 :
+			if(!BP0)etat_futur=ValeurKp;
+			break;
+
+		case Attente3 :
+			if(!BP0)etat_futur=Arret;
+			break;
+
+		case Attente2 :
+			if(!BP0)etat_futur=ValeurKd;
+			break;
+
+		case AttenteJack :
+			IHM_LCD_locate(0,0);
+			IHM_LCD_printf("Retirer jack");
+			sommeErreurs = 0;
+			if(!Jack)etat_futur=Avancer;
+			break;
+
+
+	}
+	switch(etat_courant){
+
+		case SeuilCapt :
+			MotD = 0.0, MotG = 0.0;
+			break;
+
+		case Arret :
+			MotD = 0.0, MotG = 0.0;
+			break;
+
+		case Avancer :
+			MotG = VitesseAdaptative - correction - VitRaccourci;
+			MotD = VitesseAdaptative + correction - VitRaccourci;
+			t=TIM_read_ms()/250;
+			if (MotG > 1.0) MotG = 1.0;
+			if (MotG < 0) MotG = 0.0;
+			if (MotD > 1.0) MotD = 1.0;
+			if (MotD < 0) MotD = 0.0;
+			if (CaptEG > 0.70 && CaptED < SBf && CaptG > 0.65 && CaptD > 0.65 && !ValRaccourci)
+			{
+				TIM_reset();
+				VitRaccourci = 0.1;
+				IHM_LCD_locate(0,0);
+				ValRaccourciVal=1;
+				IHM_LCD_printf("Val = %02d",ValRaccourciVal);
+				ValRaccourci=true;
+				ValSecondRaccourci = false;
+				ValTroisiemeRaccourci = false;
+			}
+			if (t>6) {
+				ValRaccourciVal=0;
+				IHM_LCD_printf("Val = %02d",ValRaccourciVal);
+				ValRaccourci=false;
+				ValSecondRaccourci = false;
+				ValTroisiemeRaccourci = false;
+			}
+			if (CaptEG > 0.70 && ValRaccourci && CaptG > 0.65 && CaptD > 0.65 && t>2 )
+			{
+				TIM_reset();
+				ValRaccourciVal=0;
+				ValRaccourci=false;
+				IHM_LCD_locate(0,0);
+				ValRaccourciVal=1;
+				IHM_LCD_printf("Raccourci 2");
+				ValSecondRaccourci = true;
+			}
+
+			break;
+
+		case FinDeCourse :
+			MotG=0;
+			MotD=0;
+			break;
+
+		case Redressement :
+			break;
+
+		case Raccourci :
+			break;
+		case Raccourci2 :
+			break;
+		case Raccourci3 :
+			break;
+		case RaccourciFast:
+			break;
+
+		case ValeurKp :
+			break;
+		case ValeurKd :
+			break;
+
+		case Attente1 :
+			break;
+		case Attente2:
+			break;
+		case Attente3 :
+			break;
+
+		case AttenteJack :
+			break;
+
+	}
+	PWM_write(PWMG, MotG);
+	PWM_write(PWMD, MotD);
+	/* if(Minuteur_ecran > 2000) {
+	IHM_LCD_locate(1,0);
+	IHM_LCD_printf("Co = %4.2f%%",correction);
+	}
+	 */
+}
